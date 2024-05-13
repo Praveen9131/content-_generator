@@ -23,9 +23,8 @@ def generate_content(topic, desired_word_count):
         remaining_words = desired_word_count - current_word_count
         extra_tokens = int(remaining_words * 1.3)  # Continue estimating needed tokens
 
-        predefined_text = f"Based on the fundamentals of {topic}, create content that encompasses the core concepts and challenges students' understanding. Provide a complete, concise explanation and conclusion."
-        template = f"Text: {predefined_text} You are an expert content generator. Continue the text to elaborate on {topic}, aiming for an additional {remaining_words} words. Ensure all sentences are complete and wrap up the discussion comprehensively within the total word count of {desired_word_count}."
-
+        predefined_text = f"Based on the fundamentals of {topic}, create content that encompasses the core concepts and challenges students' understanding. Continue generating the content."
+        template = f"Text: {predefined_text} You are an expert content generator. Continue the text to elaborate on {topic}, aiming for an additional {remaining_words} words with human language and give me without any grammertical mistakes."
         
         prompt_template = PromptTemplate(input_variables=["topic"], template=template)
         llm_chain = LLMChain(llm=llm, prompt=prompt_template, output_key="content")
@@ -41,11 +40,13 @@ def generate_content(topic, desired_word_count):
     final_content = ' '.join(content.split()[:desired_word_count])
     return final_content
 
+
+
+
 @app.route('/generate', methods=['GET'])
 def generate_api():
     topic = request.args.get('topic')
     words = request.args.get('words', type=int)
     content = generate_content(topic, words)
     return jsonify({"content": content})
-
 
