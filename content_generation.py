@@ -1,52 +1,202 @@
+import openai
 import os
-from flask import Flask, request, jsonify
-from langchain.chat_models import ChatOpenAI
-from langchain.prompts import PromptTemplate
-from langchain.chains import LLMChain
+import random
+import re
 from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Optional
+from fastapi.concurrency import run_in_threadpool
 
-app = Flask(__name__)
+# Load the environment variables from .env file
 load_dotenv()
 
-KEY = os.getenv("OPENAI_API_KEY")
+# Create an empty list to store the API keys
+api_keys = []
 
-def generate_content(topic, desired_word_count):
-    llm = ChatOpenAI(openai_api_key=KEY, model_name="gpt-4", temperature=1.0)
+# Define the prefix for the environment variable names
+prefix = "OPENAI_API_KEY_"
+
+# Loop through the environment variables and find all API keys
+idx = 1
+while True:
+    env_var_name = f"{prefix}{idx}"
+    api_key = os.getenv(env_var_name)
+
+    # If the environment variable is not found, break the loop
+    if api_key is None:
+        break
+
+    api_keys.append(api_key)
+    idx += 1
+
+# Set current index to get the api key on each request
+current_api_idx = 0
+
+model_name = "gpt-3.5-turbo-16k"
+temperature = 0.6
+default_max_tokens = 15000
+
+def get_next_api_key():
+    global current_api_idx
+    api_key = api_keys[current_api_idx]
+    current_api_idx = (current_api_idx + 1) % len(api_keys)
+    return api_key
+
+def parse_word_count(word_count):
+    if isinstance(word_count, str) and 'to' in word_count:
+        min_count, max_count = map(int, word_count.split('to'))
+        return min_count, max_count
+    count = int(word_count)
+    return count, count
+
+def is_complete_sentence(text):
+    return text.endswith(('.', '!', '?'))
+
+async def complete_text(text):
+    if not is_complete_sentence(text):
+        complete_prompt = f"Complete the following text to ensure it ends with a complete sentence: {text}"
+        final_response = await openai.ChatCompletion.acreate(
+            model=model_name,
+            messages=[{"role": "user", "content": complete_prompt}],
+            max_tokens=50,
+            temperature=temperature,
+            api_key=get_next_api_key()
+        )
+        final_message = final_response["choices"][0]["message"]["content"].strip()
+        text += " " + final_message
+    return text
+
+async def adjust_word_count(text, min_word_count, max_word_count):
+    words = text.split()
+    current_word_count = len(words)
     
-    # Estimate token count needed for desired word count
-    estimated_tokens = int(desired_word_count * 1.3)  # Rough estimation
+    if min_word_count <= current_word_count <= max_word_count:
+        return text
+
+    if current_word_count > max_word_count:
+        summarize_prompt = f"Summarize the following text to fit within {max_word_count} words: {text}"
+        summarize_response = await openai.ChatCompletion.acreate(
+            model=model_name,
+            messages=[{"role": "user", "content": summarize_prompt}],
+            max_tokens=max_word_count * 5,
+            temperature=temperature,
+            api_key=get_next_api_key()
+        )
+        summarized_text = summarize_response["choices"][0]["message"]["content"].strip()
+        return summarized_text
     
-    content = ""
-    current_word_count = 0
+    if current_word_count < min_word_count:
+        additional_words_needed = min_word_count - current_word_count
+        expand_prompt = f"Expand the following text by adding approximately {additional_words_needed} words, ensuring it consists of complete sentences: {text}"
+        expand_response = await openai.ChatCompletion.acreate(
+            model=model_name,
+            messages=[{"role": "user", "content": expand_prompt}],
+            max_tokens=additional_words_needed * 5,
+            temperature=temperature,
+            api_key=get_next_api_key()
+        )
+        expanded_text = expand_response["choices"][0]["message"]["content"].strip()
+        return expanded_text
     
-    while current_word_count < desired_word_count:
-        remaining_words = desired_word_count - current_word_count
-        extra_tokens = int(remaining_words * 1.3)  # Continue estimating needed tokens
+    return text
 
-        predefined_text = f"Based on the fundamentals of {topic}, create content that encompasses the core concepts and challenges students' understanding. Continue generating the content."
-        template = f"Text: {predefined_text} You are an expert content generator. Continue the text to elaborate on {topic}, aiming for an additional {remaining_words} words with human language and give me without any grammertical mistakes."
+async def generate_article(title, word_count, conversation_history=None, prefixes=None):
+    min_word_count, max_word_count = parse_word_count(word_count)
+    prompt = f"Write a section titled '{title}' with approximately {max_word_count} words. Ensure the content is well-organized, informative, and consists of complete sentences. Avoid incomplete sentences."
+    if prefixes:
+        all_prefix = '\n'.join(prefixes)
+        prompt = f"{all_prefix}\n\n{prompt}"
+    
+    response = None
+    retries = 3
+    generated_text = ""
+
+    while retries > 0:
+        if conversation_history:
+            messages = conversation_history.copy()
+            messages.append({"role": "user", "content": prompt})
+        else:
+            messages = [{"role": "user", "content": prompt}]
+
+        try:
+            response = await openai.ChatCompletion.acreate(
+                model=model_name,
+                messages=messages,
+                max_tokens=default_max_tokens,
+                temperature=temperature,
+                api_key=get_next_api_key()
+            )
+        except Exception as e:
+            retries -= 1
+            continue
+
+        message = response["choices"][0]["message"]
+        generated_text = message["content"].strip()
         
-        prompt_template = PromptTemplate(input_variables=["topic"], template=template)
-        llm_chain = LLMChain(llm=llm, prompt=prompt_template, output_key="content")
+        words = generated_text.split()
+        if len(words) >= min_word_count:
+            break
+
+    generated_text = await complete_text(generated_text)
+    generated_text = await adjust_word_count(generated_text, min_word_count, max_word_count)
+    
+    # Ensure final word count is within the specified range
+    while not (min_word_count <= len(generated_text.split()) <= max_word_count):
+        generated_text = await adjust_word_count(generated_text, min_word_count, max_word_count)
+        generated_text = await complete_text(generated_text)
+
+    return generated_text
+
+async def process_requests(sections, prefixes=None, save_conversation_history=False):
+    conversation_history = None
+    results = []
+
+    for idx, section in enumerate(sections):
+        title = section.title.strip()
+        word_count = section.word_count
+        response = await generate_article(title, word_count, conversation_history, prefixes)
         
-        response = llm_chain({"topic": topic})
-        generated_text = response.get("content", "")
-        
-        # Append new content and update word count
-        content += " " + generated_text
-        current_word_count = len(content.split())
+        results.append({"title": title, "content": response, "word_count": len(response.split())})
 
-    # Return the content trimmed to the exact desired word count
-    final_content = ' '.join(content.split()[:desired_word_count])
-    return final_content
+        if save_conversation_history:
+            if conversation_history:
+                conversation_history.append({"role": "assistant", "content": response})
+            else:
+                conversation_history = [{"role": "assistant", "content": response}]
+            conversation_history[-1]["content"] += "\n"
 
+    return results
 
+class SectionInput(BaseModel):
+    class Section(BaseModel):
+        title: str
+        word_count: str
 
+    sections: List[Section]
+    prefixes: Optional[List[str]] = None
+    save_conversation_history: Optional[bool] = False
 
-@app.route('/generate', methods=['GET'])
-def generate_api():
-    topic = request.args.get('topic')
-    words = request.args.get('words', type=int)
-    content = generate_content(topic, words)
-    return jsonify({"content": content})
+app = FastAPI()
 
+# Enable CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.post("/generate-article")
+async def generate_article_endpoint(input: SectionInput):
+    try:
+        result = await process_requests(input.sections, input.prefixes, input.save_conversation_history)
+        return JSONResponse(content={"result": result}, status_code=200)
+    except Exception as e:
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
