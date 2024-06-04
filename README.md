@@ -39,7 +39,7 @@ This project is a FastAPI-based web application designed to generate articles us
    pip install -r requirements.txt
    ```
 
-4. **Set up environment variables:**
+4. **Set up environment variables:** 
 
    Create a `.env` file in the root directory of the project and add your OpenAI API keys. Use the following format:
 
